@@ -1,0 +1,7 @@
+.venv
+.env
+_pycache_/
+*.pyc
+# macOS
+.DS_Store
+**/.DS_Store
