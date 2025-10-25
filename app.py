@@ -29,10 +29,26 @@ load_dotenv()
 API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 TARGET_SR = 16000
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)  # Only show errors
 log = logging.getLogger("voiceapp")
+log.setLevel(logging.INFO)  # But keep INFO for our app
+
+# Suppress noisy warnings from streamlit_webrtc
+logging.getLogger("streamlit_webrtc").setLevel(logging.ERROR)
+logging.getLogger("aioice").setLevel(logging.ERROR)
+logging.getLogger("aiortc").setLevel(logging.ERROR)
 
 st.set_page_config(page_title="Talk-to-Text", page_icon="🎙️", layout="wide")
+
+# Custom CSS for better UI
+st.markdown("""
+<style>
+    /* Make the app look cleaner */
+    .stTextInput > div > div > input {
+        border-radius: 20px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ------------------ Session State ------------------
 if "transcript" not in st.session_state:
@@ -149,9 +165,7 @@ def run_assemblyai(audio_queue, text_queue, stop_event):
 
                 # Log first chunk only
                 if chunk_count == 1:
-                    samples = np.frombuffer(chunk, dtype=np.int16)
-                    rms = np.sqrt(np.mean(samples.astype(np.float32)**2))
-                    log.info(f"First audio chunk: RMS={rms:.1f}")
+                    log.info("Audio streaming started")
                 yield chunk
             except queue.Empty:
                 # Send silence to keep connection alive
@@ -170,13 +184,27 @@ if not API_KEY:
     st.error("Missing ASSEMBLYAI_API_KEY in .env file")
     st.stop()
 
-# Start/Stop button (before auto-refresh to allow button clicks)
-col1, col2 = st.columns([1, 3])
-with col1:
-    if not st.session_state.streaming:
-        if st.button("START", type="primary", key="start_btn"):
+# Only auto-refresh when streaming to update transcript
+if st.session_state.streaming:
+    count = st_autorefresh(interval=100, key="refresh")
+else:
+    count = 0
+
+# Voice/Chat input field with microphone button
+if not st.session_state.streaming:
+    # Show editable input with previous transcript or placeholder
+    col1, col2 = st.columns([9, 1])
+    with col1:
+        current_value = st.session_state.transcript.strip() if st.session_state.transcript.strip() else ""
+        user_input = st.text_input("Chat Input", value=current_value, placeholder="Ask anything", key="chat_editable", label_visibility="collapsed")
+
+        # If user edited the text, update the transcript
+        if user_input != current_value:
+            st.session_state.transcript = user_input
+    with col2:
+        if st.button("🎤", key="mic_btn", help="Start voice recording"):
             st.session_state.streaming = True
-            st.session_state.transcript = ""
+            # Don't clear transcript - append to it
             st.session_state.interim_text = ""
             st.session_state.last_final = ""
             # Clear queues
@@ -194,67 +222,64 @@ with col1:
             )
             thread.start()
             st.session_state.aai_thread = thread
-            log.info("START button pressed, streaming started")
+            log.info("Voice recording started")
             st.rerun()
-    else:
-        if st.button("STOP", key="stop_btn"):
+else:
+    # Show transcript in the input field while recording
+    col1, col2 = st.columns([9, 1])
+    with col1:
+        # Combine final transcript with interim text
+        current_text = st.session_state.transcript.strip()
+        if st.session_state.interim_text:
+            current_text += " " + st.session_state.interim_text
+
+        st.text_input("Live Transcript", value=current_text, key=f"live_transcript_{count}", disabled=True, label_visibility="collapsed")
+    with col2:
+        if st.button("⏹️", key="stop_btn", help="Stop recording"):
             st.session_state.streaming = False
             st.session_state.stop_event.set()
-            log.info("STOP button pressed, streaming stopped")
+            # Keep the transcript for editing
+            log.info(f"Voice recording stopped. Transcript: '{st.session_state.transcript.strip()}'")
             st.rerun()
-
-# Only auto-refresh when streaming to update transcript
-if st.session_state.streaming:
-    count = st_autorefresh(interval=100, key="refresh")
-else:
-    count = 0
-
-# WebRTC audio streamer - pass audio_queue to processor
-audio_queue = st.session_state.audio_queue
-webrtc_ctx = webrtc_streamer(
-    key="audio",
-    mode=WebRtcMode.SENDONLY,
-    audio_processor_factory=lambda: AudioProcessor(audio_queue),
-    media_stream_constraints={
-        "audio": {
-            "echoCancellation": True,
-            "noiseSuppression": True,
-            "autoGainControl": True,
-        },
-        "video": False
-    },
-    async_processing=True,
-    desired_playing_state=st.session_state.streaming,
-)
 
 # Update transcript from queue
 while not st.session_state.text_queue.empty():
     text, is_final = st.session_state.text_queue.get()
     if is_final:
-        # Skip duplicates (AssemblyAI sends both "hello" and "Hello.")
-        text_lower = text.lower().strip().rstrip('.')
-        last_lower = st.session_state.last_final.lower().strip().rstrip('.')
+        # Simple duplicate check - only skip if exactly the same as last final
+        text_clean = text.lower().strip().rstrip('.').rstrip(',').rstrip('!').rstrip('?')
+        last_clean = st.session_state.last_final.lower().strip().rstrip('.').rstrip(',').rstrip('!').rstrip('?')
 
-        if text_lower != last_lower:
+        # Only skip exact duplicates (like "hello" and "Hello.")
+        if text_clean and text_clean != last_clean:
             # Append final transcript
             st.session_state.transcript += text + " "
             st.session_state.last_final = text
-            st.session_state.interim_text = ""
+            log.info(f"Added: '{text}'")
+        else:
+            log.info(f"Skipped exact duplicate: '{text}'")
+
+        st.session_state.interim_text = ""
     else:
-        # Show interim result
+        # Show interim result (but don't log every interim update)
         st.session_state.interim_text = text
 
-# Display transcript
-st.subheader("Transcript")
-
-# Show interim text separately for better visibility
-if st.session_state.interim_text:
-    st.caption(f"🎤 Listening: _{st.session_state.interim_text}_")
-
-full_display = st.session_state.transcript.strip()
-
-# Use unique key based on refresh count to force update
-if full_display:
-    st.text_area("Final Transcript", value=full_display, height=350, key=f"transcript_{count}", label_visibility="collapsed")
-else:
-    st.info("Waiting for speech...")
+# WebRTC audio streamer (run in background without UI)
+# Note: The WebRTC component will still show some UI, but we minimize it
+with st.expander("Audio Settings (Advanced)", expanded=False):
+    audio_queue = st.session_state.audio_queue
+    webrtc_ctx = webrtc_streamer(
+        key="audio",
+        mode=WebRtcMode.SENDONLY,
+        audio_processor_factory=lambda: AudioProcessor(audio_queue),
+        media_stream_constraints={
+            "audio": {
+                "echoCancellation": True,
+                "noiseSuppression": True,
+                "autoGainControl": True,
+            },
+            "video": False
+        },
+        async_processing=True,
+        desired_playing_state=st.session_state.streaming,
+    )
